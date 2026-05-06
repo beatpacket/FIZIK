@@ -1,0 +1,46 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Stores user settings and exam dates.",
+      "type": "object",
+      "properties": {
+        "createdAt": {
+          "type": "timestamp"
+        },
+        "updatedAt": {
+          "type": "timestamp"
+        },
+        "examDate": {
+          "type": "string",
+          "description": "ISO date string for the exam"
+        }
+      },
+      "required": ["createdAt", "updatedAt"]
+    },
+    "CompletedTicket": {
+      "title": "Completed Ticket",
+      "description": "A ticket/question completed by the user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "completedAt": {
+          "type": "timestamp"
+        }
+      },
+      "required": ["id", "completedAt"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "User profile containing base preferences."
+    },
+    "users/{userId}/completedTickets/{ticketId}": {
+      "schema": "CompletedTicket",
+      "description": "Tracks completed tickets."
+    }
+  }
+}

@@ -1,0 +1,70 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-\\.]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['createdAt', 'updatedAt']) && 
+             data.keys().size() >= 2 &&
+             data.keys().size() <= 3 &&
+             data.createdAt == request.time &&
+             data.updatedAt == request.time &&
+             (!('examDate' in data) || (data.examDate is string && data.examDate.size() <= 24));
+    }
+
+    function isUpdateUser(data) {
+      return data.updatedAt == request.time;
+    }
+    
+    function isValidCompletedTicket(data) {
+      return data.keys().hasAll(['id', 'completedAt']) &&
+             data.keys().size() == 2 &&
+             data.id is string && data.id.size() <= 64 &&
+             data.completedAt == request.time;
+    }
+
+    function isValidExamResult(data) {
+      return data.keys().hasAll(['score', 'passed', 'date']) &&
+             data.keys().size() == 3 &&
+             data.score is number &&
+             data.passed is bool &&
+             data.date == request.time;
+    }
+
+    match /users/{userId} {
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == userId && isValidId(userId) && isValidUser(incoming());
+      allow update: if isSignedIn() && request.auth.uid == userId && isUpdateUser(incoming()) && incoming().diff(existing()).affectedKeys().hasOnly(['examDate', 'updatedAt']) && (!('examDate' in incoming()) || (incoming().examDate is string && incoming().examDate.size() <= 24));
+      
+      match /examResults/{resultId} {
+        allow list, get: if isSignedIn() && request.auth.uid == userId;
+        allow create: if isSignedIn() && request.auth.uid == userId && isValidId(resultId) && isValidExamResult(incoming());
+      }
+      
+      match /completedTickets/{ticketId} {
+        allow list, get: if isSignedIn() && request.auth.uid == userId;
+        allow create: if isSignedIn() && request.auth.uid == userId && isValidId(ticketId) && isValidCompletedTicket(incoming());
+        allow delete: if isSignedIn() && request.auth.uid == userId;
+      }
+    }
+  }
+}
