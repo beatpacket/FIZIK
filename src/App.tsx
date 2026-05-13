@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { CheckCircle2, Circle, ChevronLeft, BookOpen, Settings, LogIn, LogOut } from 'lucide-react';
+import { CheckCircle2, Circle, ChevronLeft, BookOpen, Settings, LogIn, LogOut, Send, Bot, User as UserIcon, Loader2, PanelLeft, History } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
@@ -7,9 +7,39 @@ import { LESSONS, themeColors, themeOrder } from './data';
 import { testsData } from './testsData';
 import { auth, db, loginWithGoogle, logout, handleFirestoreError, OperationType } from './firebase';
 import { onAuthStateChanged, User } from 'firebase/auth';
-import { doc, setDoc, onSnapshot, collection, deleteDoc, serverTimestamp } from 'firebase/firestore';
+import { doc, setDoc, updateDoc, onSnapshot, collection, deleteDoc, serverTimestamp } from 'firebase/firestore';
+
+export type ChatMessage = { role: 'user' | 'assistant', content: string };
+export type ChatSession = {
+  id: string; // lesson.id or 'global'
+  title: string;
+  theme: string;
+  messages: ChatMessage[];
+  updatedAt: number;
+};
+
+const loadChatHistory = (): Record<string, ChatSession> => {
+  try {
+    return JSON.parse(localStorage.getItem('deepseek_chats') || '{}');
+  } catch {
+    return {};
+  }
+};
+
+const saveChatSession = (session: ChatSession) => {
+  const history = loadChatHistory();
+  history[session.id] = session;
+  localStorage.setItem('deepseek_chats', JSON.stringify(history));
+};
+
+const removeChatSession = (id: string) => {
+  const history = loadChatHistory();
+  delete history[id];
+  localStorage.setItem('deepseek_chats', JSON.stringify(history));
+};
 
 function TestBlock({ test }: { test: any }) {
+
   const [answers, setAnswers] = useState<Record<number, string>>({});
 
   const handleSelect = (idx: number, opt: string) => {
@@ -78,6 +108,333 @@ function TestBlock({ test }: { test: any }) {
   );
 }
 
+function DeepSeekChat({ lesson, sessionId, isGlobal = false, onOpenHistory }: { lesson: any, sessionId: string, isGlobal?: boolean, onOpenHistory?: () => void }) {
+  const [apiKey, setApiKey] = useState(() => {
+    try {
+      return (import.meta as any).env.VITE_DEEPSEEK_API_KEY || localStorage.getItem('deepseek_api_key') || '';
+    } catch {
+      return localStorage.getItem('deepseek_api_key') || '';
+    }
+  });
+  const [isApiKeySet, setIsApiKeySet] = useState(!!apiKey);
+  
+  const [messages, setMessages] = useState<ChatMessage[]>(() => {
+    const history = loadChatHistory();
+    return history[sessionId]?.messages || [];
+  });
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+
+  useEffect(() => {
+    if (messages.length > 0) {
+      saveChatSession({
+        id: sessionId,
+        title: lesson ? lesson.title : 'Общий помощник',
+        theme: lesson ? lesson.theme : 'Общая тема',
+        messages,
+        updatedAt: Date.now()
+      });
+    }
+  }, [messages, sessionId, lesson]);
+
+  const saveKey = (key: string) => {
+    setApiKey(key);
+    setIsApiKeySet(!!key);
+    if (key) {
+      localStorage.setItem('deepseek_api_key', key);
+    } else {
+      localStorage.removeItem('deepseek_api_key');
+    }
+  };
+
+  const sendMessage = async () => {
+    if (!input.trim() || !apiKey) return;
+    
+    const userMsg = input.trim();
+    setInput('');
+    const newMessages: ChatMessage[] = [...messages, { role: 'user', content: userMsg }];
+    setMessages(newMessages);
+    setIsLoading(true);
+
+    try {
+      const systemPrompt = lesson 
+        ? `Ты преподаватель физики и помощник для экзаменов. Ученик изучает следующий материал (Тема: ${lesson.theme}, Название: ${lesson.title}):\n${lesson.content}\n\nТвоя задача — отвечать на вопросы ученика по этому билету, объяснять непонятные моменты, решения или задачи подробно и понятно. Поясняй все так, чтобы было понятно. Отвечай на русском языке. Используй markdown.`
+        : `Ты преподаватель физики и помощник для экзаменов. Твоя задача — отвечать на любые вопросы ученика по физике за 8 класс, объяснять непонятные моменты подробно и понятно, без привязки к конкретному билету. Отвечай на русском языке. Используй markdown.`;
+      
+      const apiMessages = [
+        { role: 'system', content: systemPrompt },
+        ...newMessages.map(m => ({ role: m.role, content: m.content }))
+      ];
+
+      const res = await fetch('https://api.deepseek.com/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: 'deepseek-chat',
+          messages: apiMessages,
+          stream: true
+        })
+      });
+
+      if (!res.ok) throw new Error(await res.text());
+      
+      const reader = res.body?.getReader();
+      const decoder = new TextDecoder("utf-8");
+      
+      let assistantMessage = '';
+      setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
+
+      if (reader) {
+        let buffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          
+          for (const line of lines) {
+            const trimmedLine = line.trim();
+            if (trimmedLine.startsWith('data: ') && trimmedLine !== 'data: [DONE]') {
+              try {
+                const data = JSON.parse(trimmedLine.slice(6));
+                if (data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content) {
+                  assistantMessage += data.choices[0].delta.content;
+                  setMessages(prev => {
+                    const newMessages = [...prev];
+                    newMessages[newMessages.length - 1] = { role: 'assistant', content: assistantMessage };
+                    return newMessages;
+                  });
+                }
+              } catch (e) {
+                // ignore partial JSON errors
+              }
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      console.error(e);
+      setMessages(prev => [...prev, { role: 'assistant', content: `Ошибка: ${e.message || 'Не удалось получить ответ'}` }]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  if (!isApiKeySet) {
+    return (
+      <div className={isGlobal 
+        ? "bg-slate-50 border-y sm:border border-slate-200 p-4 sm:p-6 sm:rounded-3xl rounded-3xl flex-1 flex flex-col"
+        : "bg-slate-50 border border-slate-200 p-4 sm:p-6 rounded-2xl sm:rounded-3xl mt-8 w-full"}>
+        <div className="flex items-center gap-2 sm:gap-3 mb-4 flex-shrink-0">
+          {onOpenHistory && (
+             <button 
+               onClick={onOpenHistory}
+               className="w-10 h-10 flex items-center justify-center rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-600 transition-colors shrink-0"
+               title="История диалогов"
+             >
+               <PanelLeft className="w-5 h-5" />
+             </button>
+          )}
+          <div className="w-10 h-10 bg-indigo-100 rounded-xl flex items-center justify-center text-indigo-600">
+            <Bot className="w-6 h-6" />
+          </div>
+          <div>
+            <h3 className="font-bold text-slate-800">DeepSeek AI Помощник</h3>
+            <p className="text-xs text-slate-500">Введите API ключ DeepSeek для активации</p>
+          </div>
+        </div>
+        <div className="flex flex-col sm:flex-row gap-3">
+          <input 
+            type="password" 
+            placeholder="sk-..." 
+            className="flex-1 bg-white border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            value={apiKey}
+            onChange={e => setApiKey(e.target.value)}
+          />
+          <button onClick={() => saveKey(apiKey)} className="bg-indigo-600 text-white px-6 py-3 rounded-xl font-bold hover:bg-indigo-700 transition">
+            Сохранить
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={isGlobal 
+        ? "bg-white sm:bg-slate-50 sm:border border-slate-200 p-2 sm:p-6 sm:rounded-3xl rounded-3xl flex-1 flex flex-col min-h-0"
+        : "bg-slate-50 border border-slate-200 p-4 sm:p-6 rounded-2xl sm:rounded-3xl mt-8 flex flex-col w-full"}>
+      <div className="flex items-center justify-between mb-4 flex-shrink-0 px-2 sm:px-0">
+        <div className="flex items-center gap-2 sm:gap-3">
+          {onOpenHistory && (
+             <button 
+               onClick={onOpenHistory}
+               className="w-10 h-10 flex items-center justify-center rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-600 transition-colors shrink-0"
+               title="История диалогов"
+             >
+               <PanelLeft className="w-5 h-5" />
+             </button>
+          )}
+          <div className="w-10 h-10 bg-indigo-100 rounded-xl flex items-center justify-center text-indigo-600">
+            <Bot className="w-6 h-6" />
+          </div>
+          <div>
+            <h3 className="font-bold text-slate-800">Помощник DeepSeek</h3>
+            <p className="text-xs text-slate-500 leading-tight">Задайте вопрос по текущей теме</p>
+          </div>
+        </div>
+      </div>
+      
+      <div className="flex-1 overflow-y-auto space-y-4 mb-4 pr-2 custom-scrollbar min-h-0">
+        {messages.length === 0 && (
+          <div className="text-center text-slate-500 mt-10 text-sm p-4 bg-white sm:bg-transparent rounded-2xl">
+            Задайте свой первый вопрос, и нейросеть объяснит решение, материал билета или ответит на любой другой вопрос.
+          </div>
+        )}
+        {messages.map((msg, idx) => (
+          <div key={idx} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div className={`max-w-full sm:max-w-[90%] rounded-2xl px-4 py-3 text-sm overflow-hidden ${msg.role === 'user' ? 'bg-indigo-600 text-white rounded-br-none' : 'bg-white border border-slate-200 text-slate-700 rounded-bl-none'}`}>
+               <div className={`markdown-body text-sm break-words overflow-x-auto ${msg.role === 'user' ? 'text-white' : ''}`} style={msg.role === 'user' ? { color: 'white' } : {}}>
+                  <Markdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>{msg.content}</Markdown>
+               </div>
+            </div>
+          </div>
+        ))}
+        {isLoading && (
+          <div className="flex justify-start">
+             <div className="bg-white border border-slate-200 text-slate-400 rounded-2xl rounded-bl-none px-4 py-3 flex items-center gap-2">
+               <Loader2 className="w-4 h-4 animate-spin" />
+               <span className="text-sm">Печатает...</span>
+             </div>
+          </div>
+        )}
+      </div>
+
+      <div className="flex gap-2 flex-shrink-0 mt-auto">
+        <input 
+          type="text" 
+          value={input}
+          onChange={e => setInput(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && sendMessage()}
+          placeholder="Спросите что-нибудь..."
+          className="flex-1 bg-white border border-slate-200 rounded-xl px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+        />
+        <button 
+          onClick={sendMessage}
+          disabled={isLoading || !input.trim()}
+          className="bg-indigo-600 text-white w-12 flex-shrink-0 flex items-center justify-center rounded-xl font-bold hover:bg-indigo-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          <Send className="w-5 h-5" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function GlobalChatScreen({ onClose }: { onClose: () => void }) {
+  const [history, setHistory] = useState<Record<string, ChatSession>>({});
+  const [activeSessionId, setActiveSessionId] = useState<string>('global');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+
+  useEffect(() => {
+    setHistory(loadChatHistory());
+    
+    // Listen for updates (if updated in another tab or component)
+    const interval = setInterval(() => {
+      setHistory(loadChatHistory());
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [activeSessionId]); // Reload when switching sessions too
+
+  const activeLesson = useMemo(() => {
+    if (activeSessionId === 'global') return null;
+    return LESSONS.find(l => l.id === activeSessionId) || null;
+  }, [activeSessionId]);
+
+  const sortedSessions = Object.values(history).sort((a, b) => b.updatedAt - a.updatedAt);
+
+  return (
+    <div className="animate-in slide-in-from-bottom-4 fade-in duration-300 w-full flex-1 flex flex-col mt-2 sm:mt-4 min-h-0 relative">
+      
+      <div className="flex items-center w-full px-2 sm:px-0 mb-2 sm:mb-4 shrink-0 relative z-10">
+        <button
+          onClick={onClose}
+          className="group flex items-center text-sm font-medium text-slate-500 hover:text-slate-800 transition-colors"
+        >
+          <ChevronLeft className="w-5 h-5 mr-1 group-hover:-translate-x-1 transition-transform" />
+          Назад к темам
+        </button>
+      </div>
+
+      {/* Sliding Drawer Overlay */}
+      {isSidebarOpen && (
+        <div 
+          className="fixed inset-0 bg-slate-900/10 z-40 backdrop-blur-[2px] transition-opacity"
+          onClick={() => setIsSidebarOpen(false)}
+        />
+      )}
+
+      {/* Sliding Drawer */}
+      <div className={`fixed top-0 left-0 h-full w-[85vw] max-w-[320px] bg-white/95 backdrop-blur-xl border-r border-indigo-50 shadow-[4px_0_24px_rgba(0,0,0,0.02)] z-50 transform transition-transform duration-500 flex flex-col ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+        <div className="p-5 sm:p-6 flex items-center justify-between border-b border-slate-100/60">
+          <h3 className="font-medium text-slate-800 text-lg flex items-center gap-2">
+             <History className="w-5 h-5 text-indigo-500" />
+             История
+          </h3>
+          <button onClick={() => setIsSidebarOpen(false)} className="p-2 -mr-2 text-slate-400 hover:text-slate-600 rounded-full hover:bg-slate-100 transition-colors">
+             <ChevronLeft className="w-5 h-5" />
+          </button>
+        </div>
+        
+        <div className="flex-1 overflow-y-auto p-3 sm:p-4 flex flex-col gap-2 custom-scrollbar">
+          <button
+            onClick={() => { setActiveSessionId('global'); setIsSidebarOpen(false); }}
+            className={`text-left px-3 py-3 sm:px-4 sm:py-4 rounded-2xl text-sm font-medium transition-all flex flex-col gap-1 ${
+              activeSessionId === 'global' ? 'bg-indigo-600 text-white shadow-md' : 'hover:bg-slate-50 text-slate-700 border border-transparent hover:border-slate-200'
+            }`}
+          >
+            <span className="font-bold text-sm sm:text-base">Общий помощник</span>
+            <span className={`text-xs ${activeSessionId === 'global' ? 'text-indigo-200' : 'text-slate-400'}`}>Любая тема по физике</span>
+          </button>
+
+          {sortedSessions.filter(s => s.id !== 'global').map(session => (
+            <button
+              key={session.id}
+              onClick={() => { setActiveSessionId(session.id); setIsSidebarOpen(false); }}
+              className={`text-left px-3 py-3 sm:px-4 sm:py-4 rounded-2xl text-sm font-medium transition-all flex flex-col gap-1.5 ${
+                activeSessionId === session.id ? 'bg-indigo-600 text-white shadow-md' : 'hover:bg-slate-50 text-slate-700 border border-transparent hover:border-slate-200'
+              }`}
+            >
+              <div className="flex justify-between items-start gap-2 w-full">
+                <span className="font-bold leading-tight line-clamp-2">{session.title}</span>
+                <span className={`text-[10px] whitespace-nowrap shrink-0 ${activeSessionId === session.id ? 'text-indigo-200' : 'text-slate-400'}`}>
+                  {new Date(session.updatedAt).toLocaleDateString('ru-RU', {day: 'numeric', month: 'short'})}
+                </span>
+              </div>
+              <span className={`text-[10px] line-clamp-2 ${activeSessionId === session.id ? 'text-indigo-200' : 'text-slate-400'}`}>{session.theme}</span>
+            </button>
+          ))}
+          {sortedSessions.length === 0 && (
+             <div className="text-center text-slate-400 text-sm py-8 px-4 bg-slate-50 rounded-2xl">
+               Пока здесь ничего нет.
+             </div>
+          )}
+        </div>
+      </div>
+
+      {/* Chat Area */}
+      <div className="flex-1 flex flex-col min-h-0 relative z-0">
+        <DeepSeekChat key={activeSessionId} lesson={activeLesson} sessionId={activeSessionId} isGlobal={true} onOpenHistory={() => setIsSidebarOpen(true)} />
+      </div>
+
+    </div>
+  );
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [completedTickets, setCompletedTickets] = useState<Set<string>>(new Set());
@@ -87,12 +444,17 @@ export default function App() {
   const [firstLoginDate, setFirstLoginDate] = useState<number | null>(null);
   const [pastExams, setPastExams] = useState<any[]>([]);
   const [showSettings, setShowSettings] = useState(false);
+  const [showGlobalChat, setShowGlobalChat] = useState(false);
   const [tempExamDate, setTempExamDate] = useState('');
 
   const [isExamMode, setIsExamMode] = useState<boolean>(false);
   const [examQuestions, setExamQuestions] = useState<any[]>([]);
   const [examAnswers, setExamAnswers] = useState<Record<number, string>>({});
   const [showExamResults, setShowExamResults] = useState<boolean>(false);
+
+  useEffect(() => {
+    window.scrollTo(0, 0);
+  }, [selectedTicketId, isExamMode, showExamResults, showGlobalChat]);
 
   const startExam = () => {
     const allQuestionsPool = testsData.flatMap(t => t.tests.flatMap(test => test.items));
@@ -185,7 +547,9 @@ export default function App() {
         updatedAt: serverTimestamp()
       }, { merge: true });
       setShowSettings(false);
-    } catch (e) {
+    } catch (e: any) {
+      alert("Ошибка сохранения: " + e.message);
+      console.error(e);
       handleFirestoreError(e, OperationType.UPDATE, 'users');
     }
   };
@@ -223,6 +587,7 @@ export default function App() {
       "Электричество": { total: 0, done: 0 },
       "Магнетизм": { total: 0, done: 0 },
       "Оптика": { total: 0, done: 0 },
+      "ЗАДАЧА": { total: 0, done: 0 },
     };
     LESSONS.forEach(l => {
       if (stats[l.theme]) {
@@ -383,7 +748,14 @@ export default function App() {
           <h1 className="text-2xl sm:text-3xl font-light text-slate-800">
             Физика <span className="font-bold">Подготовка</span>
           </h1>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 sm:gap-4">
+            <button 
+              onClick={() => setShowGlobalChat(true)}
+              className="bg-indigo-100/50 hover:bg-indigo-100 text-indigo-700 p-2 sm:px-4 sm:py-2 rounded-xl text-sm font-bold flex items-center justify-center gap-2 transition-colors relative"
+            >
+              <Bot className="w-5 h-5 sm:w-4 sm:h-4" />
+              <span className="hidden sm:inline">ИИ Ассистент</span>
+            </button>
             {user ? (
               <div className="flex items-center gap-3">
                 <button onClick={logout} className="text-sm font-medium text-slate-500 hover:text-slate-700 hidden sm:flex items-center gap-1">
@@ -406,6 +778,7 @@ export default function App() {
         </header>
 
         {/* Global Progress Header */}
+        {!showGlobalChat && (
         <div className="bg-white rounded-2xl p-4 sm:p-6 flex flex-col sm:flex-row items-center gap-6">
           <div className="flex-1 w-full space-y-4">
             <div className="flex justify-between text-sm font-bold text-green-600">
@@ -443,9 +816,12 @@ export default function App() {
             </div>
           </div>
         </div>
+        )}
 
         {/* Dynamic Area */}
-        {!selectedTicket ? (
+        {showGlobalChat ? (
+          <GlobalChatScreen onClose={() => setShowGlobalChat(false)} />
+        ) : !selectedTicket ? (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1 animate-in fade-in duration-500">
             
             {/* THEMES COLUMN */}
@@ -681,6 +1057,11 @@ export default function App() {
                     <img src={selectedTicket.imageUrl} alt={selectedTicket.title} className="w-full h-auto object-contain max-h-[60vh] mx-auto" />
                   </div>
                 )}
+              </div>
+
+              {/* DeepSeek Chat Block */}
+              <div className="mb-6">
+                <DeepSeekChat lesson={selectedTicket} sessionId={selectedTicket.id} />
               </div>
 
               {/* Test Block */}

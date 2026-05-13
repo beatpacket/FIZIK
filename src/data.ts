@@ -1,6 +1,7 @@
 import raw1 from './raw1.json';
 import raw2 from './raw2.json';
 import raw3 from './raw3.json';
+import rawTasks from './raw_tasks.json';
 
 export interface Lesson {
   id: string;
@@ -56,6 +57,7 @@ export const themeColors: Record<string, string> = {
   "Электричество": "bg-blue-50 text-blue-700 border-blue-200",
   "Магнетизм": "bg-red-50 text-red-700 border-red-200",
   "Оптика": "bg-yellow-50 text-yellow-700 border-yellow-200",
+  "ЗАДАЧА": "bg-indigo-50 text-indigo-700 border-indigo-200",
   "Общая тема": "bg-slate-50 text-slate-700 border-slate-200",
 };
 
@@ -64,17 +66,29 @@ export const themeOrder: Record<string, number> = {
   "Электричество": 2,
   "Магнетизм": 3,
   "Оптика": 4,
-  "Общая тема": 5
+  "ЗАДАЧА": 5,
+  "Общая тема": 6
 };
 
 const rawData = [...raw1, ...raw2, ...raw3];
 
-export const LESSONS: Lesson[] = rawData.flatMap((ticket: any) =>
-  ticket.questions.map((q: any) => ({
-    id: q.id,
-    originalTicketNumber: ticket.ticket,
-    title: q.topic,
-    content: q.answer,
-    theme: themeMapping[q.id] || "Общая тема"
-  }))
-);
+const tasksData: Lesson[] = rawTasks.map((t: any) => ({
+  id: `task_${t.билет}`,
+  originalTicketNumber: t.билет,
+  title: t.задача,
+  content: `**Решение:**\n${t.решение}\n\n**Объяснение:**\n${t.объяснение}`,
+  theme: "ЗАДАЧА"
+}));
+
+export const LESSONS: Lesson[] = [
+  ...rawData.flatMap((ticket: any) =>
+    ticket.questions.map((q: any) => ({
+      id: q.id,
+      originalTicketNumber: ticket.ticket,
+      title: q.topic,
+      content: q.answer,
+      theme: themeMapping[q.id] || "Общая тема"
+    }))
+  ),
+  ...tasksData
+];
